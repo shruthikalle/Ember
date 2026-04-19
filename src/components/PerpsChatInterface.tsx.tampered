@@ -1,0 +1,2605 @@
+'use client';
+
+import { useState, useRef, useEffect, useCallback } from 'react';
+import PerpsReviewModal from './PerpsReviewModal';
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface HLTradeParams {
+  assetIndex: number;
+  coin: string;
+  side: 'LONG' | 'SHORT';
+  size: string;
+  price: string;
+  leverage: number;
+  szDecimals: number;
+  reduceOnly: boolean;
+  orderType: 'market' | 'limit';
+}
+
+interface HLCloseParams {
+  assetIndex: number;
+  coin: string;
+  size: string;
+  price: string;
+  isBuy: boolean;
+  szDecimals: number;
+}
+
+interface SwapTxRequest {
+  to: string;
+  data: string;
+  value: string;
+  chainId: number;
+  gas?: string;
+  deadline: number;
+  needsApproval?: boolean;
+  approvalTransactions?: {
+    to: string;
+    data: string;
+    value: string;
+    chainId: number;
+    label: string;
+  }[];
+  approvalTransaction?: {
+    to: string;
+    data: string;
+    value: string;
+    chainId: number;
+    label: string;
+  };
+}
+
+interface SwapAction {
+  type: 'swap';
+  tokenIn: string;
+  tokenOut: string;
+  amountInFormatted: string;
+  amountOutFormatted: string;
+  txRequest: SwapTxRequest;
+}
+
+interface BridgeAction {
+  type: 'bridge';
+  amountUsdc: number;
+  fromChain: string;
+  toChain: string;
+  spokePoolAddress: string;
+  depositData: {
+    recipient: string;
+    inputToken: string;
+    outputToken: string;
+    inputAmount: string;
+    outputAmount: string;
+    destinationChainId: number;
+    exclusiveRelayer: string;
+    quoteTimestamp: number;
+    fillDeadline: number;
+    exclusivityDeadline: number;
+    message: string;
+  };
+}
+
+interface TradeAction {
+  type: 'open_trade';
+  tradeParams: HLTradeParams;
+  marketData?: {
+    markPrice: string;
+    fundingRate: string;
+    maxLeverage: number;
+  };
+  sizeUsd?: number;
+}
+
+interface CloseAction {
+  type: 'close_trade';
+  closeParams: HLCloseParams;
+}
+
+type PendingAction = SwapAction | BridgeAction | TradeAction | CloseAction;
+
+interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: number;
+  action?: PendingAction;
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
+export default function PerpsChatInterface({ onWalletChange }: { onWalletChange?: (connected: boolean) => void } = {}) {
+  // Initialize messages as empty array (fixes hydration error)
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Wallet state — initialize as null to match server render
+  const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [isClient, setIsClient] = useState(false);
+  
+  // Refs to lock wallet address during execution (prevents state updates from clearing it)
+  const walletAddressRef = useRef<string | null>(null);
+  const isExecutingRef = useRef(false);
+  
+  // Persist wallet address to localStorage & notify parent
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      if (walletAddress) {
+        localStorage.setItem('perps_wallet_address', walletAddress);
+      } else {
+        localStorage.removeItem('perps_wallet_address');
+      }
+    } catch (err) {
+      console.warn('[PerpsChat] Failed to save wallet address:', err);
+    }
+    // Notify parent page of wallet status (used to show/hide MetaMaskButton)
+    // but only when NOT in the middle of a signing chain switch
+    if (!isExecutingRef.current) {
+      onWalletChange?.(!!walletAddress);
+    }
+  }, [walletAddress, onWalletChange]);
+
+  // Mark as client-side after mount (prevents hydration mismatch)
+  useEffect(() => {
+    setIsClient(true);
+    
+    // Load wallet address from localStorage
+    try {
+      const saved = localStorage.getItem('perps_wallet_address');
+      if (saved) {
+        setWalletAddress(saved);
+      }
+    } catch (err) {
+      console.warn('[PerpsChat] Failed to load saved wallet:', err);
+    }
+    
+    // Load messages from localStorage
+    try {
+      const saved = localStorage.getItem('perps_chat_messages');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // Only restore if less than 24 hours old
+        const maxAge = 24 * 60 * 60 * 1000;
+        if (parsed.timestamp && Date.now() - parsed.timestamp < maxAge) {
+          setMessages(parsed.messages || []);
+        }
+      }
+    } catch (err) {
+      console.warn('[PerpsChat] Failed to load chat history:', err);
+    }
+  }, []);
+
+  // Persist messages to localStorage whenever they change
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(
+        'perps_chat_messages',
+        JSON.stringify({
+          messages,
+          timestamp: Date.now(),
+        }),
+      );
+    } catch (err) {
+      console.warn('[PerpsChat] Failed to save chat history:', err);
+    }
+  }, [messages]);
+
+  // Hyperliquid account status
+  const [hlStatus, setHlStatus] = useState<
+    'checking' | 'funded' | 'spot_only' | 'unfunded' | null
+  >(null);
+  const [hlBalance, setHlBalance] = useState<string | null>(null);
+  const [hlSpotUsdc, setHlSpotUsdc] = useState<string | null>(null);
+
+  // Trade execution state
+  const [executing, setExecuting] = useState(false);
+  
+  // Review modal state (similar to Uniswap flow)
+  const [reviewModal, setReviewModal] = useState<{
+    tradeParams: HLTradeParams;
+    marketData: {
+      markPrice: string;
+      fundingRate: string;
+      maxLeverage: number;
+    };
+    sizeUsd: number;
+  } | null>(null);
+
+  // ─── Auto-scroll ──────────────────────────────────────────────────────
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  // ─── Check Hyperliquid account status ─────────────────────────────────
+
+  const checkHLAccount = useCallback(async (address: string) => {
+    setHlStatus('checking');
+    setHlBalance(null);
+    setHlSpotUsdc(null);
+
+    const addr = address.toLowerCase();
+
+    try {
+      // Check BOTH perps clearinghouse and spot balances in parallel
+      const [perpsRes, spotRes] = await Promise.all([
+        fetch('/api/perps/info', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'clearinghouseState', user: addr }),
+        }),
+        fetch('/api/perps/info', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'spotClearinghouseState',
+            user: addr,
+          }),
+        }),
+      ]);
+
+      // Parse perps state — check ALL possible value fields
+      let perpsValue = 0;
+      if (perpsRes.ok) {
+        const perps = await perpsRes.json();
+        console.log('[HL] Raw perps response:', JSON.stringify({
+          marginSummary: perps?.marginSummary,
+          crossMarginSummary: perps?.crossMarginSummary,
+          withdrawable: perps?.withdrawable,
+        }));
+        // Check multiple fields — Hyperliquid returns value in different places
+        const candidates = [
+          parseFloat(perps?.marginSummary?.accountValue || '0'),
+          parseFloat(perps?.crossMarginSummary?.accountValue || '0'),
+          parseFloat(perps?.withdrawable || '0'),
+          parseFloat(perps?.marginSummary?.totalRawUsd || '0'),
+          parseFloat(perps?.crossMarginSummary?.totalRawUsd || '0'),
+        ];
+        perpsValue = Math.max(...candidates);
+        console.log('[HL] Perps value candidates:', candidates, '→ max:', perpsValue);
+      }
+
+      // Parse spot state — look for USDC balance
+      let spotUsdcBalance = 0;
+      let hasAnySpotBalance = false;
+      if (spotRes.ok) {
+        const spot = await spotRes.json();
+        const balances: { coin: string; total: string }[] =
+          spot?.balances || [];
+        for (const b of balances) {
+          if (parseFloat(b.total) > 0) hasAnySpotBalance = true;
+          if (b.coin === 'USDC') {
+            spotUsdcBalance = parseFloat(b.total);
+          }
+        }
+      }
+
+      console.log(
+        `[HL] Account check: perps=$${perpsValue.toFixed(2)}, spotUSDC=$${spotUsdcBalance.toFixed(2)}, anySpot=${hasAnySpotBalance}`,
+      );
+
+      // Unified account: spot USDC is available for perps trading too
+      const totalAvailable = Math.max(perpsValue, perpsValue + spotUsdcBalance, spotUsdcBalance);
+
+      if (perpsValue > 0 || (spotUsdcBalance > 0)) {
+        // Funded — either perps has funds, or spot has USDC (unified account)
+        setHlStatus('funded');
+        setHlBalance(`$${totalAvailable.toFixed(2)}`);
+        if (spotUsdcBalance > 0 && perpsValue === 0) {
+          setHlSpotUsdc(`$${spotUsdcBalance.toFixed(2)}`);
+        }
+      } else if (hasAnySpotBalance) {
+        // Has non-USDC spot assets but no USDC
+        setHlStatus('spot_only');
+        setHlBalance(null);
+      } else {
+        setHlStatus('unfunded');
+        setHlBalance(null);
+      }
+    } catch (err) {
+      console.warn('[HL] Account check error:', err);
+      setHlStatus('unfunded');
+    }
+  }, []);
+
+
+  // ─── Detect MetaMask and auto-reconnect ──────────────────────────────────
+
+  useEffect(() => {
+    const checkWallet = async () => {
+      if (typeof window === 'undefined' || !(window as any).ethereum) return;
+      // Don't check wallet during execution — chain switches fire connect/
+      // disconnect events that would clear wallet state mid-signing
+      if (isExecutingRef.current) return;
+      
+      try {
+        // First, check if we have a saved wallet address
+        const savedAddress = walletAddress;
+        
+        // Check currently connected accounts
+        const accounts: string[] = await (window as any).ethereum.request({
+          method: 'eth_accounts',
+        });
+        
+        if (accounts?.length > 0) {
+          const addr = accounts[0];
+          setWalletAddress(addr);
+          walletAddressRef.current = addr;
+          checkHLAccount(addr);
+        } else if (savedAddress) {
+          // We have a saved address but MetaMask disconnected
+          // Try to reconnect automatically (silently, won't prompt)
+          try {
+            const reconnected: string[] = await (window as any).ethereum.request({
+              method: 'eth_requestAccounts',
+            });
+            if (reconnected?.length > 0 && reconnected[0].toLowerCase() === savedAddress.toLowerCase()) {
+              setWalletAddress(reconnected[0]);
+              walletAddressRef.current = reconnected[0];
+              checkHLAccount(reconnected[0]);
+            } else {
+              // Different account or still disconnected
+              // CRITICAL: Don't clear if we're executing (chain switch might cause this)
+              if (!isExecutingRef.current && !walletAddressRef.current) {
+                setWalletAddress(null);
+                setHlStatus(null);
+                setHlBalance(null);
+                // Don't clear walletAddressRef.current — let execution flow manage it
+              }
+            }
+          } catch {
+            // Reconnection failed, user will need to manually connect
+            // CRITICAL: Don't clear if we're executing (chain switch might cause this)
+            if (!isExecutingRef.current && !walletAddressRef.current) {
+              setWalletAddress(null);
+              setHlStatus(null);
+              setHlBalance(null);
+              // Don't clear walletAddressRef.current — let execution flow manage it
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('[PerpsChat] Wallet check error:', error);
+      }
+    };
+    
+    checkWallet();
+
+    // Listen for account changes
+    if (typeof window !== 'undefined' && (window as any).ethereum) {
+      const handleChange = (accounts: string[]) => {
+        // CRITICAL: Never update wallet state during execution — chain switches
+        // cause MetaMask to temporarily return empty accounts, which would
+        // clear wallet state and break signing.
+        if (isExecutingRef.current) {
+          console.log('[PerpsChat] ⚠️ Ignoring accountsChanged during execution (chain switch)');
+          return;
+        }
+        
+        // Double-check: if we have a locked wallet address, never clear it
+        if (walletAddressRef.current && accounts.length === 0) {
+          console.log('[PerpsChat] ⚠️ Ignoring empty accounts (likely chain switch)');
+          return;
+        }
+        
+        // Only update if accounts actually changed (not just a re-check)
+        const currentAddr = walletAddress?.toLowerCase();
+        const newAddr = accounts[0]?.toLowerCase() || null;
+        
+        if (accounts.length === 0) {
+          // Only clear state if we're really sure the user disconnected
+          // (not during a chain switch or execution)
+          // CRITICAL: Double-check guards right before state update (React state
+          // updates are async, so guards might have changed)
+          if (isExecutingRef.current || walletAddressRef.current) {
+            console.log('[PerpsChat] ⚠️ Ignoring empty accounts — execution active or wallet locked');
+            return;
+          }
+          // NOTE: We don't clear walletAddressRef.current here — it's managed
+          // by the execution flow to prevent race conditions.
+          console.log('[PerpsChat] Accounts empty — clearing wallet state (but keeping ref)');
+          setWalletAddress(null);
+          setHlStatus(null);
+          setHlBalance(null);
+          // Don't clear walletAddressRef.current — let execution flow manage it
+        } else if (newAddr && newAddr !== currentAddr) {
+          // Account actually changed - update
+          console.log('[PerpsChat] Account changed:', newAddr);
+          setWalletAddress(accounts[0]);
+          walletAddressRef.current = accounts[0];
+          checkHLAccount(accounts[0]);
+        }
+        // If same account, don't update state unnecessarily (prevents disconnection during trades)
+      };
+      
+      const handleConnect = (connectInfo: { chainId: string }) => {
+        // Ignore connect events during signing — chain switches to 1337 and
+        // back fire connect/disconnect events that would clear wallet state.
+        if (isExecutingRef.current) {
+          console.log('[PerpsChat] Ignoring connect event during execution (chain switch)');
+          return;
+        }
+        checkWallet();
+      };
+      
+      const handleDisconnect = (error: any) => {
+        // CRITICAL: Never clear wallet state during execution — chain switches
+        // cause MetaMask to fire disconnect events that would break signing.
+        if (isExecutingRef.current) {
+          console.log('[PerpsChat] ⚠️ Ignoring disconnect event during execution (chain switch)');
+          return;
+        }
+        
+        // Double-check: if we have a locked wallet address, never clear it
+        if (walletAddressRef.current) {
+          console.log('[PerpsChat] ⚠️ Ignoring disconnect (wallet address locked)');
+          return;
+        }
+        
+        // Only disconnect if MetaMask actually disconnected
+        // Don't clear on temporary connection issues during signing
+        if (typeof window !== 'undefined' && (window as any).ethereum) {
+          // Check if MetaMask is still available
+          (window as any).ethereum.request({ method: 'eth_accounts' })
+            .then((accounts: string[]) => {
+              if (accounts.length === 0 && !isExecutingRef.current && !walletAddressRef.current) {
+                // Actually disconnected (and not during execution)
+                // NOTE: We don't clear walletAddressRef.current here — it's managed
+                // by the execution flow to prevent race conditions.
+                console.log('[PerpsChat] MetaMask actually disconnected');
+                setWalletAddress(null);
+                setHlStatus(null);
+                setHlBalance(null);
+                // Don't clear walletAddressRef.current — let execution flow manage it
+              }
+            })
+            .catch(() => {
+              // MetaMask unavailable - only clear if not executing
+              if (!isExecutingRef.current && !walletAddressRef.current) {
+                setWalletAddress(null);
+                setHlStatus(null);
+                setHlBalance(null);
+                // Don't clear walletAddressRef.current — let execution flow manage it
+              }
+            });
+        } else {
+          // MetaMask not available - only clear if not executing
+          if (!isExecutingRef.current && !walletAddressRef.current) {
+            setWalletAddress(null);
+            setHlStatus(null);
+            setHlBalance(null);
+            // Don't clear walletAddressRef.current — let execution flow manage it
+          }
+        }
+      };
+      
+      const handleChainChanged = (_chainId: string) => {
+        // Ignore chain changes during signing — we intentionally switch to
+        // chain 1337 for Hyperliquid EIP-712 signatures and then switch back.
+        if (isExecutingRef.current) {
+          console.log('[PerpsChat] Ignoring chainChanged during execution:', _chainId);
+          return;
+        }
+      };
+
+      (window as any).ethereum.on('accountsChanged', handleChange);
+      (window as any).ethereum.on('connect', handleConnect);
+      (window as any).ethereum.on('disconnect', handleDisconnect);
+      (window as any).ethereum.on('chainChanged', handleChainChanged);
+      
+      return () => {
+        (window as any).ethereum?.removeListener?.('accountsChanged', handleChange);
+        (window as any).ethereum?.removeListener?.('connect', handleConnect);
+        (window as any).ethereum?.removeListener?.('disconnect', handleDisconnect);
+        (window as any).ethereum?.removeListener?.('chainChanged', handleChainChanged);
+      };
+    }
+  }, [checkHLAccount, walletAddress]);
+
+  // ─── Message helpers ──────────────────────────────────────────────────
+
+  const addMessage = useCallback(
+    (
+      role: Message['role'],
+      content: string,
+      action?: PendingAction,
+    ): Message => {
+      const msg: Message = {
+        id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        role,
+        content,
+        timestamp: Date.now(),
+        action,
+      };
+      setMessages((prev) => [...prev, msg]);
+      return msg;
+    },
+    [],
+  );
+
+  // ─── Connect MetaMask ──────────────────────────────────────────────────
+
+  const connectWallet = useCallback(async () => {
+    if (typeof window === 'undefined' || !(window as any).ethereum) {
+      addMessage('assistant', '❌ MetaMask not detected. Please install MetaMask to trade.');
+      return;
+    }
+
+    try {
+      // Request connection (this will prompt user if not already connected)
+      const accounts: string[] = await (window as any).ethereum.request({
+        method: 'eth_requestAccounts',
+      });
+      
+      if (accounts?.length > 0) {
+        const addr = accounts[0];
+        setWalletAddress(addr);
+        walletAddressRef.current = addr;
+        checkHLAccount(addr);
+        addMessage('assistant', `✅ Connected: ${addr.slice(0, 6)}...${addr.slice(-4)}`);
+      }
+    } catch (error: any) {
+      if (error?.code === 4001) {
+        addMessage('assistant', '⚠️ Connection rejected. Please connect MetaMask to trade.');
+      } else {
+        console.error('[PerpsChat] Connection error:', error);
+        addMessage('assistant', `❌ Connection failed: ${error?.message || 'Unknown error'}`);
+      }
+    }
+  }, [checkHLAccount, addMessage]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = input.trim();
+    if (!trimmed || loading) return;
+
+    addMessage('user', trimmed);
+    setInput('');
+    setLoading(true);
+
+    try {
+      const history = [
+        ...messages.map((m) => ({ role: m.role, content: m.content })),
+        { role: 'user' as const, content: trimmed },
+      ];
+
+      const res = await fetch('/api/perps/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history, walletAddress }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      const action = data.action as PendingAction | undefined;
+      
+      addMessage(
+        'assistant',
+        data.content || 'No response received.',
+        action,
+      );
+      
+      // If it's a trade action, show review modal instead of executing immediately
+      if (action?.type === 'open_trade' && action.marketData && action.sizeUsd) {
+        setReviewModal({
+          tradeParams: action.tradeParams,
+          marketData: action.marketData,
+          sizeUsd: action.sizeUsd,
+        });
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      addMessage('assistant', `❌ Error: ${msg}`);
+    } finally {
+      setLoading(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  // ─── Create MetaMask-backed wallet for Hyperliquid SDK ────────────────
+  //
+  // Uses the AbstractEthersV6Signer interface:
+  //   signTypedData(domain, types, value) — 3 args
+  //   getAddress() — returns address
+  //   provider — null
+  //
+  // Hyperliquid L1 actions sign against EIP-712 domain with chainId=1337.
+  // MetaMask enforces that the domain chainId must match the active chain.
+  // We handle this by temporarily switching to chain 1337 before every sign,
+  // then switching back immediately after. Chain 1337 is backed by our own
+  // JSON-RPC stub at /api/rpc/hl (no real chain — just enough for MetaMask).
+  // ──────────────────────────────────────────────────────────────────────
+
+  const createHLWallet = useCallback(
+    (address: string) => {
+      const ethereum = (window as any).ethereum;
+
+      return {
+        // 3-argument signTypedData matches ethers v6 interface
+        signTypedData: async function signTypedData(
+          domain: { name?: string; version?: string; chainId?: number; verifyingContract?: string },
+          types: Record<string, { name: string; type: string }[]>,
+          value: Record<string, unknown>,
+        ): Promise<string> {
+          if (!ethereum) throw new Error('MetaMask not available');
+
+          // Build EIP712Domain type from the domain object fields
+          const domainType: { name: string; type: string }[] = [];
+          if (domain.name !== undefined) domainType.push({ name: 'name', type: 'string' });
+          if (domain.version !== undefined) domainType.push({ name: 'version', type: 'string' });
+          if (domain.chainId !== undefined) domainType.push({ name: 'chainId', type: 'uint256' });
+          if (domain.verifyingContract !== undefined) domainType.push({ name: 'verifyingContract', type: 'address' });
+
+          // Primary type = first key in the types object
+          const primaryType = Object.keys(types)[0];
+
+          const payload = {
+            domain,
+            types: { EIP712Domain: domainType, ...types },
+            primaryType,
+            message: value,
+          };
+
+          // JSON.stringify with BigInt support
+          const bigIntReplacer = (_key: string, v: unknown) =>
+            typeof v === 'bigint' ? Number(v) : v;
+          const jsonPayload = JSON.stringify(payload, bigIntReplacer);
+
+          // Log what we're signing for debugging
+          const isOrder = primaryType === 'Order' || primaryType === 'OrderWire' || primaryType === 'OrderRequest';
+          const isAgent = primaryType === 'Agent';
+          
+          console.log('[HL Wallet] signTypedData:', {
+            primaryType,
+            isOrder: isOrder ? '✅ ORDER' : isAgent ? '⚠️ AGENT/CONNECTION' : '❓ OTHER',
+            chainId: domain.chainId,
+            domainName: domain.name,
+            types: Object.keys(types),
+            messageKeys: Object.keys(value),
+            message: value,
+          });
+          
+          // Warn if this looks like a connection signature when we expect an order
+          if (isAgent) {
+            console.warn('[HL Wallet] ⚠️ Signing Agent/Connection message (this is normal for leverage updates)');
+          }
+
+          const HL_CHAIN_HEX = '0x539'; // 1337
+
+          // Helper: check if error is a user rejection
+          const isUserRejection = (err: any): boolean => {
+            const code = err?.code ?? err?.data?.code;
+            if (code === 4001 || code === 'ACTION_REJECTED') return true;
+            const msg = String(err?.message || '');
+            return msg.includes('rejected') || msg.includes('denied');
+          };
+
+          // Helper: attempt signing with a given method
+          const trySign = async (method: string): Promise<string> => {
+            // Before signing, verify we're on the correct chain - CRITICAL CHECK
+            const currentChain = await ethereum.request({ method: 'eth_chainId' }).catch(() => null);
+            const normalizedCurrent = normalizeChainId(currentChain);
+            // #region agent log
+            // #endregion
+            
+            if (normalizedCurrent !== normalizedHLChain) {
+              const errorMsg = `CRITICAL: Chain mismatch in trySign! Current: ${currentChain} (normalized: ${normalizedCurrent}), Expected: ${HL_CHAIN_HEX} (normalized: ${normalizedHLChain}). Cannot sign.`;
+              console.error(`[HL Wallet] ${errorMsg}`);
+              // #region agent log
+              // #endregion
+              throw new Error(`Cannot sign: MetaMask is on chain ${currentChain} but Hyperliquid requires chain 1337. Please switch to chain 1337 in MetaMask.`);
+            }
+            
+            console.log(`[HL Wallet] Chain verified in trySign, attempting ${method}...`);
+            // #region agent log
+            // #endregion
+            try {
+              const sig = await ethereum.request({
+                method,
+                params: [address, jsonPayload],
+              });
+              // #region agent log
+              // #endregion
+              return sig;
+            } catch (signErr: any) {
+              // #region agent log
+              // #endregion
+              throw signErr;
+            }
+          };
+
+          // ── Step 1: Save current chain ──
+          let prevChain: string | null = null;
+          try {
+            prevChain = await ethereum.request({ method: 'eth_chainId' });
+            console.log('[HL Wallet] Current chain before signing:', prevChain);
+            // #region agent log
+            // #endregion
+          } catch { /* ignore */ }
+
+          // ── Step 2: Switch to chain 1337 if needed ──
+          // Normalize chain IDs for comparison (handle both hex strings and numbers)
+          const normalizeChainId = (chainId: string | number | null | undefined): string | null => {
+            if (!chainId) return null;
+            if (typeof chainId === 'string') {
+              // Convert hex to number and back to ensure consistent format
+              const num = parseInt(chainId, 16);
+              if (isNaN(num)) return null;
+              return `0x${num.toString(16)}`;
+            }
+            if (typeof chainId === 'number') {
+              return `0x${chainId.toString(16)}`;
+            }
+            return null;
+          };
+          const normalizedPrevChain = normalizeChainId(prevChain);
+          const normalizedHLChain = normalizeChainId(HL_CHAIN_HEX);
+          
+          if (normalizedPrevChain !== normalizedHLChain) {
+            console.log('[HL Wallet] Switching to chain 1337 for signing…');
+            try {
+              await ethereum.request({
+                method: 'wallet_switchEthereumChain',
+                params: [{ chainId: HL_CHAIN_HEX }],
+              });
+              console.log('[HL Wallet] Switched to chain 1337 ✓');
+              // #region agent log
+              // #endregion
+            } catch (switchErr: any) {
+              // #region agent log
+              // #endregion
+              if (isUserRejection(switchErr)) throw switchErr;
+
+              // Chain doesn't exist → add it with our stub RPC
+              const code = switchErr?.code;
+              const msg = String(switchErr?.message || '');
+              if (code === 4902 || msg.includes('Unrecognized') || msg.includes('not been added')) {
+                console.log('[HL Wallet] Chain 1337 not found — adding via stub RPC…');
+                const rpcUrl = `${window.location.origin}/api/rpc/hl`;
+                console.log('[HL Wallet] Adding chain 1337 with RPC URL:', rpcUrl);
+                // #region agent log
+                // #endregion
+                try {
+                  await ethereum.request({
+                    method: 'wallet_addEthereumChain',
+                    params: [{
+                      chainId: HL_CHAIN_HEX,
+                      chainName: 'Hyperliquid (Signing)',
+                      nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+                      rpcUrls: [rpcUrl],
+                      blockExplorerUrls: [],
+                    }],
+                  });
+                  console.log('[HL Wallet] Chain 1337 added ✓');
+                  // #region agent log
+                  // #endregion
+                  // After adding, try switching again
+                  await ethereum.request({
+                    method: 'wallet_switchEthereumChain',
+                    params: [{ chainId: HL_CHAIN_HEX }],
+                  });
+                  console.log('[HL Wallet] Switched to chain 1337 after adding ✓');
+                } catch (addErr: any) {
+                  if (isUserRejection(addErr)) throw addErr;
+                  console.error('[HL Wallet] Failed to add chain 1337:', addErr);
+                  // #region agent log
+                  // #endregion
+                  throw new Error(
+                    `Could not add Hyperliquid signing chain to MetaMask: ${addErr?.message || 'Unknown error'}. ` +
+                    `Please add a custom network manually: Chain ID 1337, RPC URL: ${rpcUrl}`
+                  );
+                }
+              } else {
+                console.error('[HL Wallet] Unexpected switch error:', switchErr);
+                throw switchErr;
+              }
+            }
+            // Wait longer for MetaMask to fully register the switch
+            await new Promise((r) => setTimeout(r, 1000));
+            
+            // Verify chain actually switched - MANDATORY, don't proceed if failed
+            let verifyChain: string | null = null;
+            let chainVerified = false;
+            // #region agent log
+            // #endregion
+            for (let i = 0; i < 10; i++) {
+              try {
+                verifyChain = await ethereum.request({ method: 'eth_chainId' });
+                const normalizedVerify = normalizeChainId(verifyChain);
+                // #region agent log
+                // #endregion
+                if (normalizedVerify === normalizedHLChain) {
+                  console.log(`[HL Wallet] Chain switch verified ✓ (attempt ${i + 1}/10)`);
+                  chainVerified = true;
+                  // #region agent log
+                  // #endregion
+                  break;
+                }
+                if (i < 9) {
+                  console.log(`[HL Wallet] Chain verification attempt ${i + 1}/10: current=${verifyChain}, expected=${HL_CHAIN_HEX}, waiting 500ms...`);
+                  await new Promise((r) => setTimeout(r, 500));
+                }
+              } catch (verifyErr) {
+                console.warn(`[HL Wallet] Chain verification attempt ${i + 1} error:`, verifyErr);
+                if (i < 9) {
+                  await new Promise((r) => setTimeout(r, 500));
+                }
+              }
+            }
+            
+            if (!chainVerified) {
+              const normalizedVerify = normalizeChainId(verifyChain);
+              const errorMsg = `CRITICAL: Chain verification failed after 10 attempts. Current chain: ${verifyChain} (normalized: ${normalizedVerify}), Expected: ${HL_CHAIN_HEX} (normalized: ${normalizedHLChain}). Cannot proceed with signing.`;
+              console.error(`[HL Wallet] ${errorMsg}`);
+              // #region agent log
+              // #endregion
+              throw new Error(errorMsg);
+            }
+          }
+
+          // ── Step 3: Sign on chain 1337 ──
+          try {
+            // Double-check chain before signing
+            const currentChainBeforeSign = await ethereum.request({ method: 'eth_chainId' }).catch(() => null);
+            const normalizedCurrentChain = normalizeChainId(currentChainBeforeSign);
+            console.log('[HL Wallet] Current chain before signing:', currentChainBeforeSign, 'normalized:', normalizedCurrentChain);
+            console.log('[HL Wallet] Expected chain:', HL_CHAIN_HEX, 'normalized:', normalizedHLChain);
+            
+            if (normalizedCurrentChain !== normalizedHLChain) {
+              console.warn(`[HL Wallet] ⚠️ Chain mismatch before signing! Current: ${currentChainBeforeSign}, Expected: ${HL_CHAIN_HEX}`);
+              // #region agent log
+              // #endregion
+              // Try one more switch attempt
+              try {
+                await ethereum.request({
+                  method: 'wallet_switchEthereumChain',
+                  params: [{ chainId: HL_CHAIN_HEX }],
+                });
+                await new Promise((r) => setTimeout(r, 500));
+                const recheckChain = await ethereum.request({ method: 'eth_chainId' }).catch(() => null);
+                console.log('[HL Wallet] Re-checked chain after retry:', recheckChain);
+                if (normalizeChainId(recheckChain) !== normalizedHLChain) {
+                  throw new Error(`Failed to switch to chain 1337. Current chain: ${recheckChain}, Expected: ${HL_CHAIN_HEX}`);
+                }
+              } catch (retryErr: any) {
+                throw new Error(`Cannot sign: MetaMask is on chain ${currentChainBeforeSign} but Hyperliquid requires chain 1337. ${retryErr?.message || ''}`);
+              }
+            }
+            
+            console.log('[HL Wallet] Signing with eth_signTypedData_v4 on chain 1337…');
+            let sig: string;
+            
+            try {
+              sig = await trySign('eth_signTypedData_v4');
+              // #region agent log
+              // #endregion
+            } catch (err: any) {
+              // If user rejected, propagate immediately
+              if (isUserRejection(err)) throw err;
+              
+              // Check if it's a chain mismatch error - retry chain switch
+              const errorMsg = String(err?.message || '');
+              const isChainMismatch = errorMsg.includes('chainId') && errorMsg.includes('must match') || 
+                                     errorMsg.includes('chain') && errorMsg.includes('1337') ||
+                                     err?.code === -32603;
+              
+              if (isChainMismatch) {
+                console.warn('[HL Wallet] Chain mismatch detected during signing, retrying chain switch...');
+                // #region agent log
+                // #endregion
+                
+                // Force chain switch again
+                try {
+                  await ethereum.request({
+                    method: 'wallet_switchEthereumChain',
+                    params: [{ chainId: HL_CHAIN_HEX }],
+                  });
+                  // Wait longer for MetaMask to fully switch
+                  await new Promise((r) => setTimeout(r, 1000));
+                  
+                  // Verify switch
+                  const recheckChain = await ethereum.request({ method: 'eth_chainId' }).catch(() => null);
+                  const normalizedRecheck = normalizeChainId(recheckChain);
+                  if (normalizedRecheck !== normalizedHLChain) {
+                    throw new Error(`Chain switch failed. Current: ${recheckChain}, Expected: ${HL_CHAIN_HEX}`);
+                  }
+                  
+                  // Retry signing after successful switch
+                  sig = await trySign('eth_signTypedData_v4');
+                  console.log('[HL Wallet] Signing succeeded after chain switch retry ✓');
+                } catch (retryErr: any) {
+                  if (isUserRejection(retryErr)) throw retryErr;
+                  console.error('[HL Wallet] Chain switch retry failed:', retryErr);
+                  throw new Error(`Failed to switch to chain 1337 for signing: ${retryErr?.message || 'Unknown error'}`);
+                }
+              } else {
+                console.warn('[HL Wallet] eth_signTypedData_v4 failed, trying v3…', err?.message);
+                // #region agent log
+                // #endregion
+                // Fallback: try eth_signTypedData_v3
+                sig = await trySign('eth_signTypedData_v3');
+              }
+            }
+            
+            console.log('[HL Wallet] Signature obtained ✓');
+
+            // ── Step 4: Switch back to a real chain (wait for completion) ──
+            // Always go back to the user's previous chain, or Base if they were
+            // already on 1337 (shouldn't idle on the signing-only chain).
+            const returnTo = (prevChain && prevChain !== HL_CHAIN_HEX) ? prevChain : '0x2105'; // Base 8453
+            try {
+              await ethereum.request({
+                method: 'wallet_switchEthereumChain',
+                params: [{ chainId: returnTo }],
+              });
+              console.log('[HL Wallet] Switched back to original chain ✓');
+              // Small delay to let MetaMask settle after chain switch
+              await new Promise((r) => setTimeout(r, 500));
+            } catch (switchBackErr) {
+              // Log but don't fail - chain switch back is best effort
+              console.warn('[HL Wallet] Failed to switch back to original chain:', switchBackErr);
+            }
+
+            return sig;
+          } catch (signErr: any) {
+            // Always try to switch back to a real chain, even on error
+            const returnTo = (prevChain && prevChain !== HL_CHAIN_HEX) ? prevChain : '0x2105';
+            try {
+              await ethereum.request({
+                method: 'wallet_switchEthereumChain',
+                params: [{ chainId: returnTo }],
+              });
+              // Small delay to let MetaMask settle after chain switch
+              await new Promise((r) => setTimeout(r, 500));
+            } catch (switchBackErr) {
+              // Log but don't fail - chain switch back is best effort
+              console.warn('[HL Wallet] Failed to switch back to original chain after error:', switchBackErr);
+            }
+
+            if (isUserRejection(signErr)) throw signErr;
+            console.error('[HL Wallet] Signing failed even on chain 1337:', signErr);
+            throw signErr;
+          }
+        },
+
+        getAddress: async function getAddress(): Promise<string> {
+          return address;
+        },
+
+        provider: null,
+      };
+    },
+    [],
+  );
+
+  // ─── Execute trade via Hyperliquid SDK ────────────────────────────────
+
+  const handleOpenTrade = useCallback(
+    async (action: TradeAction) => {
+      // Use ref as fallback — if state was cleared during a previous execution,
+      // the ref still has the locked address
+      const addr = walletAddress || walletAddressRef.current;
+      if (!addr || executing) return;
+      
+      // CRITICAL: Set execution guard IMMEDIATELY (synchronously) before any
+      // async operations. This prevents event handlers from clearing wallet
+      // state during chain switches for signing.
+      walletAddressRef.current = addr;
+      isExecutingRef.current = true;
+      setExecuting(true);
+      
+      // Restore wallet state if it was cleared (defensive)
+      if (!walletAddress && addr) {
+        setWalletAddress(addr);
+      }
+      
+      // Don't verify wallet here - let the SDK handle it. The wallet creation
+      // will fail if MetaMask isn't available, and that's fine.
+
+      try {
+        const p = action.tradeParams;
+        console.log('[Hyperliquid] ========== STARTING TRADE ==========');
+        console.log('[Hyperliquid] Trade params:', p);
+        console.log('[Hyperliquid] Wallet address:', addr);
+        console.log('[Hyperliquid] Wallet ref:', walletAddressRef.current);
+        // #region agent log
+        // #endregion
+        
+        addMessage(
+          'assistant',
+          `⚙️ Preparing ${p.side} ${p.coin} — ${p.leverage}x leverage…`,
+        );
+
+        // Dynamically import the SDK (browser-compatible)
+        console.log('[Hyperliquid] Importing SDK...');
+        const { ExchangeClient, HttpTransport } = await import(
+          '@nktkas/hyperliquid'
+        );
+        console.log('[Hyperliquid] SDK imported');
+
+        // Use the address we validated at the start (ref is already set)
+        const lockedAddress = walletAddressRef.current || addr;
+        if (!lockedAddress) {
+          throw new Error('Wallet address lost during execution');
+        }
+        console.log('[Hyperliquid] Using locked address:', lockedAddress);
+
+        console.log('[Hyperliquid] Creating wallet...');
+        const wallet = createHLWallet(lockedAddress);
+        console.log('[Hyperliquid] Wallet created');
+        
+        const transport = new HttpTransport();
+        console.log('[Hyperliquid] Creating exchange client...');
+        let exchange = new ExchangeClient({
+          transport,
+          wallet: wallet as any,
+          signatureChainId: '0xa4b1', // Arbitrum (42161) — Hyperliquid mainnet
+        });
+        console.log('[Hyperliquid] Exchange client created');
+
+        // 1. Set leverage (this signs an "Agent" connection message)
+        addMessage(
+          'assistant',
+          `📝 Setting ${p.leverage}x leverage — please **sign connection** in MetaMask…`,
+        );
+        console.log('[Hyperliquid] Updating leverage...');
+        
+        // Retry leverage update with exponential backoff
+        let leverageUpdated = false;
+        let leverageAttempts = 0;
+        const maxLeverageAttempts = 3;
+        let leverageLastErrorWasConnectionError = false;
+        
+        while (!leverageUpdated && leverageAttempts < maxLeverageAttempts) {
+          try {
+            leverageAttempts++;
+            
+            // Only check/reconnect if previous error was a connection error
+            if (leverageAttempts > 1 && leverageLastErrorWasConnectionError && typeof window !== 'undefined' && (window as any).ethereum) {
+              // Wait a bit for MetaMask to settle after chain switches
+              await new Promise(resolve => setTimeout(resolve, 500));
+              
+              try {
+                const accounts = await (window as any).ethereum.request({ method: 'eth_accounts' });
+                if (accounts.length === 0 || accounts[0].toLowerCase() !== lockedAddress.toLowerCase()) {
+                  console.warn('[Hyperliquid] Wallet appears disconnected, attempting to reconnect...');
+                  // Attempt to reconnect
+                  const reconnected = await (window as any).ethereum.request({ method: 'eth_requestAccounts' });
+                  if (reconnected.length > 0 && reconnected[0].toLowerCase() === lockedAddress.toLowerCase()) {
+                    walletAddressRef.current = reconnected[0];
+                    console.log('[Hyperliquid] Wallet reconnected, continuing...');
+                  } else {
+                    throw new Error('Wallet disconnected and could not reconnect');
+                  }
+                } else {
+                  // Wallet is still connected, update ref
+                  walletAddressRef.current = accounts[0];
+                  console.log('[Hyperliquid] Wallet still connected, continuing retry...');
+                }
+              } catch (reconnectErr) {
+                console.error('[Hyperliquid] Wallet reconnection check failed:', reconnectErr);
+                throw new Error('Wallet connection lost during leverage update');
+              }
+            }
+            
+            if (leverageAttempts > 1) {
+              console.log(`[Hyperliquid] Leverage update attempt ${leverageAttempts}/${maxLeverageAttempts}...`);
+              addMessage(
+                'assistant',
+                `🔄 Retrying leverage update (attempt ${leverageAttempts}/${maxLeverageAttempts})…`,
+              );
+              // Wait before retry (exponential backoff)
+              await new Promise(resolve => setTimeout(resolve, 1000 * leverageAttempts));
+            }
+            
+            // Reset connection error flag before attempting
+            leverageLastErrorWasConnectionError = false;
+            
+            // #region agent log
+            // #endregion
+            await exchange.updateLeverage({
+              asset: p.assetIndex,
+              isCross: false,
+              leverage: p.leverage,
+            });
+            leverageUpdated = true;
+            console.log('[Hyperliquid] Leverage updated successfully');
+            // #region agent log
+            // #endregion
+          } catch (leverageError: any) {
+            console.error(`[Hyperliquid] Leverage update attempt ${leverageAttempts} failed:`, leverageError);
+            // #region agent log
+            // #endregion
+            if (leverageAttempts >= maxLeverageAttempts) {
+              throw new Error(`Failed to update leverage after ${maxLeverageAttempts} attempts: ${leverageError?.message || 'Unknown error'}`);
+            }
+            // Check if it's a user rejection - don't retry
+            if (leverageError?.code === 4001 || leverageError?.code === 'ACTION_REJECTED') {
+              throw leverageError;
+            }
+            // Check if it's a connection error - might be recoverable
+            const errorMsg = leverageError?.message || '';
+            const isConnectionError = errorMsg.includes('Wallet') || errorMsg.includes('connection') || errorMsg.includes('disconnected') || errorMsg.includes('MetaMask') || errorMsg.includes('sign typed data');
+            if (isConnectionError) {
+              leverageLastErrorWasConnectionError = true;
+              console.log('[Hyperliquid] Connection error detected, will retry with reconnection check');
+              continue;
+            }
+            // For non-connection errors, don't retry with reconnection
+            leverageLastErrorWasConnectionError = false;
+            continue;
+          }
+        }
+
+        // Small delay to ensure leverage is fully processed
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Check chain state before order placement - we may have switched back after leverage update
+        // Proactively ensure we're on chain 1337 before order placement to avoid chain mismatch errors
+        if (typeof window !== 'undefined' && (window as any).ethereum) {
+          const HL_CHAIN_HEX = '0x539'; // 1337
+          const currentChainBeforeOrder = await (window as any).ethereum.request({ method: 'eth_chainId' }).catch(() => null);
+          console.log('[Hyperliquid] Chain state before order placement:', currentChainBeforeOrder);
+          // #region agent log
+          // #endregion
+          
+          // Normalize chain IDs for comparison
+          const normalizeChainId = (chainId: string | number | null | undefined): string | null => {
+            if (!chainId) return null;
+            if (typeof chainId === 'string') {
+              const num = parseInt(chainId, 16);
+              if (isNaN(num)) return null;
+              return `0x${num.toString(16)}`;
+            }
+            if (typeof chainId === 'number') {
+              return `0x${chainId.toString(16)}`;
+            }
+            return null;
+          };
+          
+          const normalizedCurrent = normalizeChainId(currentChainBeforeOrder);
+          const normalizedExpected = normalizeChainId(HL_CHAIN_HEX);
+          
+          // If we're not on chain 1337, proactively switch before order placement
+          if (normalizedCurrent !== normalizedExpected) {
+            console.log('[Hyperliquid] Not on chain 1337 before order placement, switching proactively...');
+            try {
+              await (window as any).ethereum.request({
+                method: 'wallet_switchEthereumChain',
+                params: [{ chainId: HL_CHAIN_HEX }],
+              });
+              // Wait for switch to complete
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              
+              // Verify switch
+              const verifyChain = await (window as any).ethereum.request({ method: 'eth_chainId' }).catch(() => null);
+              const normalizedVerify = normalizeChainId(verifyChain);
+              if (normalizedVerify === normalizedExpected) {
+                console.log('[Hyperliquid] Proactive chain switch to 1337 successful ✓');
+                // #region agent log
+                // #endregion
+              } else {
+                console.warn('[Hyperliquid] Proactive chain switch verification failed, but continuing...');
+              }
+            } catch (switchErr: any) {
+              // If chain doesn't exist, try adding it
+              if (switchErr?.code === 4902 || String(switchErr?.message || '').includes('Unrecognized')) {
+                const rpcUrl = `${window.location.origin}/api/rpc/hl`;
+                try {
+                  await (window as any).ethereum.request({
+                    method: 'wallet_addEthereumChain',
+                    params: [{
+                      chainId: HL_CHAIN_HEX,
+                      chainName: 'Hyperliquid (Signing)',
+                      nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+                      rpcUrls: [rpcUrl],
+                      blockExplorerUrls: [],
+                    }],
+                  });
+                  await (window as any).ethereum.request({
+                    method: 'wallet_switchEthereumChain',
+                    params: [{ chainId: HL_CHAIN_HEX }],
+                  });
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                } catch (addErr) {
+                  console.warn('[Hyperliquid] Failed to add/switch chain proactively:', addErr);
+                  // Continue anyway - signTypedData will handle it
+                }
+              } else {
+                console.warn('[Hyperliquid] Proactive chain switch failed:', switchErr);
+                // Continue anyway - signTypedData will handle it
+              }
+            }
+          } else {
+            console.log('[Hyperliquid] Already on chain 1337 before order placement ✓');
+          }
+        }
+
+        // 2. Place order (this signs an "Order" message)
+        addMessage(
+          'assistant',
+          `📝 Placing ${p.side} order — please **sign order** in MetaMask…`,
+        );
+        console.log('[Hyperliquid] Placing order...');
+        
+        console.log('[Hyperliquid] Placing order:', {
+          assetIndex: p.assetIndex,
+          side: p.side,
+          size: p.size,
+          price: p.price,
+          leverage: p.leverage,
+          orderType: p.orderType,
+        });
+
+        // Retry order placement with exponential backoff
+        let orderPlaced = false;
+        let orderAttempts = 0;
+        const maxOrderAttempts = 3;
+        let result: any = null;
+        let orderLastErrorWasConnectionError = false;
+        
+        while (!orderPlaced && orderAttempts < maxOrderAttempts) {
+          try {
+            orderAttempts++;
+            
+            // Only check/reconnect if previous error was a connection error
+            if (orderAttempts > 1 && orderLastErrorWasConnectionError && typeof window !== 'undefined' && (window as any).ethereum) {
+              // Wait a bit for MetaMask to settle after chain switches
+              await new Promise(resolve => setTimeout(resolve, 500));
+              
+              try {
+                const accounts = await (window as any).ethereum.request({ method: 'eth_accounts' });
+                if (accounts.length === 0 || accounts[0].toLowerCase() !== lockedAddress.toLowerCase()) {
+                  console.warn('[Hyperliquid] Wallet appears disconnected, attempting to reconnect...');
+                  // Attempt to reconnect
+                  const reconnected = await (window as any).ethereum.request({ method: 'eth_requestAccounts' });
+                  if (reconnected.length > 0 && reconnected[0].toLowerCase() === lockedAddress.toLowerCase()) {
+                    walletAddressRef.current = reconnected[0];
+                    console.log('[Hyperliquid] Wallet reconnected, recreating exchange client...');
+                    // Recreate wallet and exchange with reconnected address
+                    const reconnectedWallet = createHLWallet(reconnected[0]);
+                    exchange = new ExchangeClient({
+                      transport,
+                      wallet: reconnectedWallet as any,
+                      signatureChainId: '0xa4b1',
+                    });
+                  } else {
+                    throw new Error('Wallet disconnected and could not reconnect');
+                  }
+                } else {
+                  // Wallet is still connected, update ref
+                  walletAddressRef.current = accounts[0];
+                  console.log('[Hyperliquid] Wallet still connected, continuing retry...');
+                }
+              } catch (reconnectErr) {
+                console.error('[Hyperliquid] Wallet reconnection check failed:', reconnectErr);
+                throw new Error('Wallet connection lost during order placement');
+              }
+            }
+            
+            if (orderAttempts > 1) {
+              console.log(`[Hyperliquid] Order placement attempt ${orderAttempts}/${maxOrderAttempts}...`);
+              addMessage(
+                'assistant',
+                `🔄 Retrying order placement (attempt ${orderAttempts}/${maxOrderAttempts})…`,
+              );
+              // Wait before retry (exponential backoff)
+              await new Promise(resolve => setTimeout(resolve, 1000 * orderAttempts));
+            }
+            // #region agent log
+            // #endregion
+            
+            result = await exchange.order({
+              orders: [
+                {
+                  a: p.assetIndex,
+                  b: p.side === 'LONG',
+                  p: p.price,
+                  s: p.size,
+                  r: p.reduceOnly,
+                  t: {
+                    limit: {
+                      tif: p.orderType === 'market' ? 'Ioc' : 'Gtc',
+                    },
+                  },
+                },
+              ],
+              grouping: 'na',
+            });
+            
+            orderPlaced = true;
+            console.log('[Hyperliquid] Order placed successfully');
+            console.log('[Hyperliquid] Raw order result:', JSON.stringify(result, null, 2));
+            // #region agent log
+            // #endregion
+          } catch (orderError: any) {
+            console.error(`[Hyperliquid] ========== ORDER PLACEMENT FAILED ==========`);
+            console.error(`[Hyperliquid] Attempt ${orderAttempts}/${maxOrderAttempts}`);
+            console.error(`[Hyperliquid] Error:`, orderError);
+            console.error(`[Hyperliquid] Error message:`, orderError?.message);
+            console.error(`[Hyperliquid] Error code:`, orderError?.code);
+            console.error(`[Hyperliquid] Error stack:`, orderError?.stack);
+            console.error(`[Hyperliquid] Full error object:`, JSON.stringify(orderError, Object.getOwnPropertyNames(orderError)));
+            // #region agent log
+            // #endregion
+            
+            if (orderAttempts >= maxOrderAttempts) {
+              console.error(`[Hyperliquid] Max attempts reached - throwing error`);
+              throw new Error(`Failed to place order after ${maxOrderAttempts} attempts: ${orderError?.message || 'Unknown error'}`);
+            }
+            // Check if it's a user rejection - don't retry
+            if (orderError?.code === 4001 || orderError?.code === 'ACTION_REJECTED') {
+              throw orderError;
+            }
+            // Check if it's a validation error (e.g., tick size) - don't retry
+            if (orderError?.message?.includes('tick size') || orderError?.message?.includes('Price must be divisible')) {
+              throw orderError;
+            }
+            // Check if it's a connection error - might be recoverable
+            const errorMsg = orderError?.message || '';
+            const isConnectionError = errorMsg.includes('Wallet') || errorMsg.includes('connection') || errorMsg.includes('disconnected') || errorMsg.includes('MetaMask') || errorMsg.includes('sign typed data');
+            if (isConnectionError) {
+              orderLastErrorWasConnectionError = true;
+              console.log('[Hyperliquid] Connection error detected, will retry with reconnection check');
+              continue;
+            }
+            // For non-connection errors, don't retry with reconnection
+            orderLastErrorWasConnectionError = false;
+            continue;
+          }
+        }
+
+        console.log('[Hyperliquid] Order result:', JSON.stringify(result, null, 2));
+
+        // 3. Parse result - handle different response structures
+        // The SDK might return: result.data.statuses or result.response.data.statuses
+        // or the result itself might be the statuses array
+        let statuses: any[] = [];
+        
+        if (Array.isArray(result)) {
+          statuses = result;
+        } else if (result?.data?.statuses) {
+          statuses = result.data.statuses;
+        } else if (result?.response?.data?.statuses) {
+          statuses = result.response.data.statuses;
+        } else if (result?.statuses) {
+          statuses = result.statuses;
+        } else if (result?.data && Array.isArray(result.data)) {
+          statuses = result.data;
+        }
+        
+        const status = statuses[0];
+
+        if (!status) {
+          console.error('[Hyperliquid] No status in result:', result);
+          console.error('[Hyperliquid] Full result structure:', {
+            isArray: Array.isArray(result),
+            hasData: !!result?.data,
+            hasResponse: !!result?.response,
+            hasStatuses: !!result?.statuses,
+            dataIsArray: Array.isArray(result?.data),
+            keys: Object.keys(result || {}),
+            resultType: typeof result,
+          });
+          // #region agent log
+          // #endregion
+          
+          // If result is truthy but no status, the order might have been submitted
+          // but the response format is unexpected - try verification
+          if (result) {
+            console.log('[Hyperliquid] Result exists but no status found - attempting verification');
+          }
+          
+          // Wait a bit and verify by checking open orders
+          addMessage(
+            'assistant',
+            `⚠️ Order submission response unclear. Verifying on Hyperliquid...`,
+          );
+          
+          // Check multiple times with increasing delays
+          const verifyOrder = async (attempt: number, maxAttempts: number = 3): Promise<boolean> => {
+            try {
+              const delay = 1000 * attempt; // 1s, 2s, 3s
+              await new Promise(resolve => setTimeout(resolve, delay));
+              
+              const openOrdersRes = await fetch('/api/perps/info', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  type: 'openOrders',
+                  user: lockedAddress.toLowerCase(),
+                }),
+              });
+              const openOrders = await openOrdersRes.json();
+              const orders = openOrders || [];
+              
+              // Try to find matching order (by coin and approximate size)
+              const matchingOrder = orders.find(
+                (o: any) => {
+                  const sizeMatch = Math.abs(parseFloat(o.sz) - parseFloat(p.size)) < 0.01;
+                  const coinMatch = o.coin === p.coin;
+                  return coinMatch && sizeMatch;
+                }
+              );
+              
+              if (matchingOrder) {
+                addMessage(
+                  'assistant',
+                  `✅ **Order confirmed on Hyperliquid!**\n\n` +
+                    `• ${p.side} ${p.coin}\n` +
+                    `• Size: ${matchingOrder.sz} ${p.coin}\n` +
+                    `• Order ID: ${matchingOrder.oid || 'N/A'}\n` +
+                    `• Status: ${matchingOrder.status || 'active'}`,
+                );
+                return true;
+              }
+              
+              // Also check if order was filled immediately by checking positions
+              try {
+                const userStateRes = await fetch('/api/perps/info', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    type: 'clearinghouseState',
+                    user: lockedAddress.toLowerCase(),
+                  }),
+                });
+                const userState = await userStateRes.json();
+                const positions = userState?.assetPositions || [];
+                const matchingPosition = positions.find(
+                  (pos: any) => pos.position?.coin === p.coin
+                );
+                
+                if (matchingPosition) {
+                  const pos = matchingPosition.position;
+                  const side = parseFloat(pos.szi) > 0 ? 'LONG' : 'SHORT';
+                  if (side === p.side) {
+                    addMessage(
+                      'assistant',
+                      `✅ **Order filled immediately!**\n\n` +
+                        `• ${p.side} ${p.coin}\n` +
+                        `• Position size: ${pos.szi} ${p.coin}\n` +
+                        `• Entry price: $${pos.entryPx || 'N/A'}`,
+                    );
+                    return true;
+                  }
+                }
+              } catch (posErr) {
+                console.warn('[Hyperliquid] Failed to check positions:', posErr);
+              }
+              
+              if (attempt < maxAttempts) {
+                // Retry verification
+                return await verifyOrder(attempt + 1, maxAttempts);
+              } else {
+                // Final attempt failed
+                addMessage(
+                  'assistant',
+                  `❌ Order not found after ${maxAttempts} verification attempts. The order may have been rejected, filled immediately, or failed. Please check your Hyperliquid account.`,
+                );
+                return false;
+              }
+            } catch (verifyErr) {
+              console.error(`[Hyperliquid] Verification attempt ${attempt} error:`, verifyErr);
+              if (attempt < maxAttempts) {
+                return await verifyOrder(attempt + 1, maxAttempts);
+              } else {
+                addMessage(
+                  'assistant',
+                  `⚠️ Could not verify order status after ${maxAttempts} attempts. Please check your Hyperliquid account manually.`,
+                );
+                return false;
+              }
+            }
+          };
+          
+          const verified = await verifyOrder(1);
+          if (verified) {
+            // Verification succeeded - order is confirmed
+            return;
+          }
+          // Verification failed - continue to show error
+          addMessage(
+            'assistant',
+            `⚠️ Could not confirm order status. Please check your Hyperliquid account at https://app.hyperliquid.xyz/portfolio`,
+          );
+          return;
+        }
+
+        if (status?.filled) {
+          // Calculate notional value for display
+          const notional = parseFloat(p.size) * parseFloat(status.filled.avgPx || p.price);
+          addMessage(
+            'assistant',
+            `✅ **Trade filled!**\n\n` +
+              `• ${p.side} ${p.coin}\n` +
+              `• Size: ${p.size} ${p.coin} ($${notional.toFixed(2)} notional)\n` +
+              `• Leverage: ${p.leverage}x\n` +
+              `• Filled at: $${status.filled.avgPx || 'market'}\n` +
+              `• Order ID: ${status.filled.oid || 'N/A'}`,
+          );
+        } else if (status?.resting) {
+          // Calculate notional value for display
+          const notional = parseFloat(p.size) * parseFloat(p.price);
+          addMessage(
+            'assistant',
+            `📋 **Order placed (resting)**\n\n` +
+              `• ${p.side} ${p.coin}\n` +
+              `• Size: ${p.size} ${p.coin} ($${notional.toFixed(2)} notional)\n` +
+              `• Limit: $${p.price}\n` +
+              `• Order ID: ${status.resting.oid || 'N/A'}`,
+          );
+        } else if (status?.error) {
+          const errorMsg = typeof status.error === 'string' 
+            ? status.error 
+            : JSON.stringify(status.error);
+          addMessage('assistant', `❌ Order rejected: ${errorMsg}`);
+        } else {
+          // Unknown status - log and verify
+          console.warn('[Hyperliquid] Unknown status:', status);
+          addMessage(
+            'assistant',
+            `⚠️ Order submitted with unknown status. Verifying...`,
+          );
+          
+          // Wait a bit then verify by checking open orders and positions
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          try {
+            const openOrdersRes = await fetch('/api/perps/info', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                type: 'openOrders',
+                user: lockedAddress.toLowerCase(),
+              }),
+            });
+            const openOrders = await openOrdersRes.json();
+            const orders = openOrders || [];
+            const matchingOrder = orders.find(
+              (o: any) => 
+                o.coin === p.coin && 
+                Math.abs(parseFloat(o.sz) - parseFloat(p.size)) < 0.01
+            );
+            
+            if (matchingOrder) {
+              addMessage(
+                'assistant',
+                `✅ **Order confirmed on Hyperliquid!**\n\n` +
+                  `• ${p.side} ${p.coin}\n` +
+                  `• Size: ${matchingOrder.sz} ${p.coin}\n` +
+                  `• Order ID: ${matchingOrder.oid || 'N/A'}`,
+              );
+              return;
+            }
+            
+            // Check if filled immediately
+            const userStateRes = await fetch('/api/perps/info', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                type: 'clearinghouseState',
+                user: lockedAddress.toLowerCase(),
+              }),
+            });
+            const userState = await userStateRes.json();
+            const positions = userState?.assetPositions || [];
+            const matchingPosition = positions.find(
+              (pos: any) => pos.position?.coin === p.coin
+            );
+            
+            if (matchingPosition) {
+              const pos = matchingPosition.position;
+              const side = parseFloat(pos.szi) > 0 ? 'LONG' : 'SHORT';
+              if (side === p.side) {
+                addMessage(
+                  'assistant',
+                  `✅ **Order filled immediately!**\n\n` +
+                    `• ${p.side} ${p.coin}\n` +
+                    `• Position size: ${pos.szi} ${p.coin}\n` +
+                    `• Entry price: $${pos.entryPx || 'N/A'}`,
+                );
+                return;
+              }
+            }
+            
+            addMessage(
+              'assistant',
+              `⚠️ Order status unclear. Please check your Hyperliquid account at https://app.hyperliquid.xyz/portfolio. Status: ${JSON.stringify(status)}`,
+            );
+          } catch (verifyErr) {
+            console.error('[Hyperliquid] Verification error:', verifyErr);
+            addMessage(
+              'assistant',
+              `⚠️ Could not verify order. Please check your Hyperliquid account manually.`,
+            );
+          }
+        }
+      } catch (error: any) {
+        const cause = error?.cause;
+        const isUserRejection =
+          error?.code === 4001 ||
+          error?.code === 'ACTION_REJECTED' ||
+          cause?.code === 4001 ||
+          cause?.code === 'ACTION_REJECTED';
+
+        const errorMsg = error?.message || 'Unknown error';
+        const isConnectionError = 
+          errorMsg.includes('Wallet') || 
+          errorMsg.includes('connection') || 
+          errorMsg.includes('disconnected') ||
+          errorMsg.includes('MetaMask not available');
+        
+        if (isUserRejection) {
+          addMessage('assistant', '⚠️ Trade was rejected in MetaMask.');
+        } else if (isConnectionError) {
+          addMessage(
+            'assistant',
+            `⚠️ Wallet connection issue: ${errorMsg}. Please ensure MetaMask is connected and try again.`,
+          );
+        } else {
+          console.error('[Hyperliquid] Trade error:', error);
+          if (cause) console.error('[Hyperliquid] Cause:', cause);
+          const detail = cause?.message || errorMsg;
+          addMessage(
+            'assistant',
+            `❌ Trade failed: ${detail}`,
+          );
+        }
+      } finally {
+        // Wait a bit for any pending chain switches to complete before clearing
+        // the execution guard. This prevents wallet disconnection events from
+        // clearing wallet state right after signing.
+        await new Promise((r) => setTimeout(r, 1000));
+        
+        // Always release execution lock
+        // Note: We keep walletAddressRef.current set to prevent event handlers
+        // from clearing wallet state. It will be updated on next successful
+        // connection or explicit disconnect.
+        isExecutingRef.current = false;
+        setExecuting(false);
+      }
+    },
+    [walletAddress, executing, addMessage, createHLWallet],
+  );
+
+  // ─── Confirm and execute trade (called from review modal) ──────────────
+
+  const handleConfirmTrade = useCallback(async () => {
+    if (!reviewModal || !walletAddress || executing) return;
+    
+    // CRITICAL: Lock wallet address BEFORE closing modal to prevent state clearing
+    // Use ref as fallback in case state gets cleared during re-render
+    const addr = walletAddress || walletAddressRef.current;
+    if (!addr) {
+      console.error('[PerpsChat] Wallet address lost before trade execution');
+      return;
+    }
+    
+    // Set execution guard IMMEDIATELY to prevent event handlers from clearing state
+    walletAddressRef.current = addr;
+    isExecutingRef.current = true;
+    
+    // Restore wallet state if it was cleared (defensive)
+    if (!walletAddress && addr) {
+      setWalletAddress(addr);
+    }
+    
+    const modalData = { ...reviewModal };
+    setReviewModal(null); // Close modal AFTER locking wallet
+
+    try {
+      const action: TradeAction = {
+        type: 'open_trade',
+        tradeParams: modalData.tradeParams,
+        marketData: modalData.marketData,
+        sizeUsd: modalData.sizeUsd,
+      };
+      // handleOpenTrade manages its own execution state and guards
+      await handleOpenTrade(action);
+    } catch (error) {
+      console.error('[PerpsChat] Trade execution error:', error);
+      // Release execution guard on error
+      isExecutingRef.current = false;
+    }
+    // Note: handleOpenTrade will clear isExecutingRef in its finally block
+  }, [reviewModal, walletAddress, executing, handleOpenTrade]);
+
+  // ─── Close position via Hyperliquid SDK ───────────────────────────────
+
+  const handleClosePosition = useCallback(
+    async (action: CloseAction) => {
+      const addr = walletAddress || walletAddressRef.current;
+      if (!addr || executing) return;
+      setExecuting(true);
+      // Restore wallet state if it was cleared (defensive)
+      if (!walletAddress && addr) {
+        setWalletAddress(addr);
+      }
+
+      try {
+        const p = action.closeParams;
+        addMessage('assistant', `🔒 Closing ${p.coin} position…`);
+
+        const { ExchangeClient, HttpTransport } = await import(
+          '@nktkas/hyperliquid'
+        );
+
+        const wallet = createHLWallet(addr);
+        const transport = new HttpTransport();
+        const exchange = new ExchangeClient({
+          transport,
+          wallet: wallet as any,
+          signatureChainId: '0xa4b1',
+        });
+
+        addMessage(
+          'assistant',
+          `📝 Please **sign the close order** in MetaMask…`,
+        );
+
+        const result: any = await exchange.order({
+          orders: [
+            {
+              a: p.assetIndex,
+              b: p.isBuy,
+              p: p.price,
+              s: p.size,
+              r: true, // reduce only
+              t: { limit: { tif: 'Ioc' } },
+            },
+          ],
+          grouping: 'na',
+        });
+
+        const statuses = result?.response?.data?.statuses || [];
+        const status = statuses[0];
+
+        if (status?.filled) {
+          addMessage(
+            'assistant',
+            `✅ **Position closed!**\n\n` +
+              `• ${p.coin}: ${p.size} closed\n` +
+              `• Filled at: $${status.filled.avgPx || 'market'}`,
+          );
+        } else if (status?.error) {
+          addMessage('assistant', `❌ Close rejected: ${status.error}`);
+        } else {
+          addMessage(
+            'assistant',
+            `✅ Close order submitted! Response: ${JSON.stringify(result).slice(0, 200)}`,
+          );
+        }
+      } catch (error: any) {
+        const cause = error?.cause;
+        const isUserRejection =
+          error?.code === 4001 ||
+          error?.code === 'ACTION_REJECTED' ||
+          cause?.code === 4001 ||
+          cause?.code === 'ACTION_REJECTED';
+
+        if (isUserRejection) {
+          addMessage(
+            'assistant',
+            '⚠️ Close position was rejected in MetaMask.',
+          );
+        } else {
+          console.error('[Hyperliquid] Close error:', error);
+          if (cause) console.error('[Hyperliquid] Cause:', cause);
+          const detail = cause?.message || error?.message || 'Unknown error';
+          addMessage(
+            'assistant',
+            `❌ Close error: ${detail}`,
+          );
+        }
+      } finally {
+        setExecuting(false);
+      }
+    },
+    [walletAddress, executing, addMessage, createHLWallet],
+  );
+
+  // ─── Execute swap via MetaMask ───────────────────────────────────────
+
+  const handleSwap = useCallback(
+    async (action: SwapAction) => {
+      const addr = walletAddress || walletAddressRef.current;
+      if (!addr || executing) return;
+      setExecuting(true);
+      // Restore wallet state if it was cleared (defensive)
+      if (!walletAddress && addr) {
+        setWalletAddress(addr);
+      }
+
+      try {
+        const ethereum = (window as any).ethereum;
+        if (!ethereum) throw new Error('MetaMask not found');
+
+        const tx = action.txRequest;
+
+        // Remember current chain so we can switch back after the swap
+        let originalChainHex: string | null = null;
+        try {
+          originalChainHex = await ethereum.request({ method: 'eth_chainId' });
+        } catch { /* ignore */ }
+
+        // Ensure we're on Base for the swap
+        const baseChainHex = '0x2105'; // 8453
+        try {
+          await ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: baseChainHex }],
+          });
+        } catch (switchErr: any) {
+          if (switchErr.code === 4902) {
+            await ethereum.request({
+              method: 'wallet_addEthereumChain',
+              params: [
+                {
+                  chainId: baseChainHex,
+                  chainName: 'Base',
+                  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+                  rpcUrls: ['https://mainnet.base.org'],
+                  blockExplorerUrls: ['https://basescan.org'],
+                },
+              ],
+            });
+          } else {
+            throw switchErr;
+          }
+        }
+
+        // Handle approvals if needed
+        const approvals = tx.approvalTransactions || (tx.approvalTransaction ? [tx.approvalTransaction] : []);
+        for (const approval of approvals) {
+          addMessage(
+            'assistant',
+            `📝 ${approval.label} — please **approve** in MetaMask…`,
+          );
+          await ethereum.request({
+            method: 'eth_sendTransaction',
+            params: [
+              {
+                from: walletAddress,
+                to: approval.to,
+                data: approval.data,
+                value: approval.value || '0x0',
+              },
+            ],
+          });
+          // Brief wait for the approval to be mined
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+
+        // Send the swap transaction
+        addMessage(
+          'assistant',
+          `🔄 Swapping ${action.amountInFormatted} ${action.tokenIn} → ${action.amountOutFormatted} ${action.tokenOut} — **sign** in MetaMask…`,
+        );
+
+        const txHash = await ethereum.request({
+          method: 'eth_sendTransaction',
+          params: [
+            {
+              from: walletAddress,
+              to: tx.to,
+              data: tx.data,
+              value: tx.value || '0x0',
+              ...(tx.gas ? { gas: `0x${parseInt(tx.gas).toString(16)}` } : {}),
+            },
+          ],
+        });
+
+        addMessage(
+          'assistant',
+          `✅ **Swap submitted!**\n\n` +
+            `• ${action.amountInFormatted} ${action.tokenIn} → ${action.amountOutFormatted} ${action.tokenOut}\n` +
+            `• Tx: [${(txHash as string).slice(0, 10)}…](https://basescan.org/tx/${txHash})`,
+        );
+
+        // Stay on Base after a swap — never switch back to chain 1337 (signing-only chain)
+        // Only switch back if the user was on a real chain other than Base/1337
+        if (
+          originalChainHex &&
+          originalChainHex !== baseChainHex &&
+          originalChainHex !== '0x539' // 1337 = HL signing chain, not a real network
+        ) {
+          ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: originalChainHex }],
+          }).catch(() => { /* best effort */ });
+        }
+      } catch (error: any) {
+        if (error?.code === 4001 || error?.code === 'ACTION_REJECTED') {
+          addMessage('assistant', '⚠️ Swap was rejected in MetaMask.');
+        } else {
+          console.error('[Swap] Error:', error);
+          addMessage(
+            'assistant',
+            `❌ Swap error: ${error?.message || 'Unknown error'}`,
+          );
+        }
+      } finally {
+        setExecuting(false);
+      }
+    },
+    [walletAddress, executing, addMessage],
+  );
+
+  // ─── Execute bridge via MetaMask (Across Protocol) ────────────────────
+
+  const handleBridge = useCallback(
+    async (action: BridgeAction) => {
+      const addr = walletAddress || walletAddressRef.current;
+      if (!addr || executing) return;
+      setExecuting(true);
+      // Restore wallet state if it was cleared (defensive)
+      if (!walletAddress && addr) {
+        setWalletAddress(addr);
+      }
+
+      try {
+        const ethereum = (window as any).ethereum;
+        if (!ethereum) throw new Error('MetaMask not found');
+
+        // Remember current chain so we can switch back after bridging
+        let originalChainHex: string | null = null;
+        try {
+          originalChainHex = await ethereum.request({ method: 'eth_chainId' });
+        } catch { /* ignore */ }
+
+        // Ensure we're on Base for the bridge
+        const baseChainHex = '0x2105'; // 8453
+        try {
+          await ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: baseChainHex }],
+          });
+        } catch (switchErr: any) {
+          if (switchErr.code === 4902) {
+            await ethereum.request({
+              method: 'wallet_addEthereumChain',
+              params: [
+                {
+                  chainId: baseChainHex,
+                  chainName: 'Base',
+                  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+                  rpcUrls: ['https://mainnet.base.org'],
+                  blockExplorerUrls: ['https://basescan.org'],
+                },
+              ],
+            });
+          } else {
+            throw switchErr;
+          }
+        }
+
+        const d = action.depositData;
+        const USDC_ADDRESS = d.inputToken;
+        const SPOKE_POOL = action.spokePoolAddress;
+
+        // 1. Approve USDC for SpokePool
+        addMessage(
+          'assistant',
+          `📝 Approving $${action.amountUsdc} USDC for the Across bridge — **approve** in MetaMask…`,
+        );
+
+        // ERC20 approve(spender, amount)
+        const approveData =
+          '0x095ea7b3' +
+          SPOKE_POOL.slice(2).padStart(64, '0') +
+          BigInt(d.inputAmount).toString(16).padStart(64, '0');
+
+        await ethereum.request({
+          method: 'eth_sendTransaction',
+          params: [
+            {
+              from: walletAddress,
+              to: USDC_ADDRESS,
+              data: approveData,
+              value: '0x0',
+            },
+          ],
+        });
+
+        // Wait for approval to be mined
+        addMessage('assistant', '⏳ Waiting for approval to confirm…');
+        await new Promise((r) => setTimeout(r, 5000));
+
+        // 2. Call depositV3 on Across SpokePool
+        addMessage(
+          'assistant',
+          `🌉 Bridging $${action.amountUsdc} USDC from Base → Arbitrum — **sign** in MetaMask…`,
+        );
+
+        // Encode depositV3(address depositor, address recipient, address inputToken, address outputToken,
+        //   uint256 inputAmount, uint256 outputAmount, uint256 destinationChainId, address exclusiveRelayer,
+        //   uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, bytes message)
+        const depositSelector = '0xe7a7ed02'; // depositV3 selector
+
+        // For a proper ABI encoding, we'll use a simpler approach — construct raw calldata
+        const pad = (hex: string) => hex.replace('0x', '').padStart(64, '0');
+        const padNum = (n: number | string) =>
+          BigInt(n).toString(16).padStart(64, '0');
+
+        const depositCalldata =
+          depositSelector +
+          pad(addr) + // depositor
+          pad(d.recipient) + // recipient
+          pad(d.inputToken) + // inputToken
+          pad(d.outputToken) + // outputToken
+          padNum(d.inputAmount) + // inputAmount
+          padNum(d.outputAmount) + // outputAmount
+          padNum(d.destinationChainId) + // destinationChainId
+          pad(d.exclusiveRelayer) + // exclusiveRelayer
+          padNum(d.quoteTimestamp) + // quoteTimestamp
+          padNum(d.fillDeadline) + // fillDeadline
+          padNum(d.exclusivityDeadline) + // exclusivityDeadline
+          // bytes offset + length + data for message "0x"
+          padNum(12 * 32) + // offset to bytes (12 params * 32)
+          padNum(0); // empty bytes length
+
+        const bridgeTxHash = await ethereum.request({
+          method: 'eth_sendTransaction',
+          params: [
+            {
+              from: walletAddress,
+              to: SPOKE_POOL,
+              data: depositCalldata,
+              value: '0x0',
+            },
+          ],
+        });
+
+        addMessage(
+          'assistant',
+          `✅ **Bridge submitted!**\n\n` +
+            `• $${action.amountUsdc} USDC: Base → Arbitrum\n` +
+            `• Estimated arrival: 2-5 minutes\n` +
+            `• Tx: [${(bridgeTxHash as string).slice(0, 10)}…](https://basescan.org/tx/${bridgeTxHash})\n\n` +
+            `After the bridge completes, deposit your USDC from Arbitrum to Hyperliquid at:\n` +
+            `**https://app.hyperliquid.xyz/portfolio**`,
+        );
+
+        // Stay on Base after a bridge — never switch back to chain 1337 (signing-only chain)
+        if (
+          originalChainHex &&
+          originalChainHex !== baseChainHex &&
+          originalChainHex !== '0x539' // 1337 = HL signing chain, not a real network
+        ) {
+          ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: originalChainHex }],
+          }).catch(() => { /* best effort */ });
+        }
+
+        // Re-check HL account after a delay (bridge takes a few minutes, but user may already have funds)
+        setTimeout(() => {
+          if (walletAddress) checkHLAccount(walletAddress);
+        }, 10_000);
+      } catch (error: any) {
+        if (error?.code === 4001 || error?.code === 'ACTION_REJECTED') {
+          addMessage('assistant', '⚠️ Bridge was rejected in MetaMask.');
+        } else {
+          console.error('[Bridge] Error:', error);
+          addMessage(
+            'assistant',
+            `❌ Bridge error: ${error?.message || 'Unknown error'}`,
+          );
+        }
+      } finally {
+        setExecuting(false);
+      }
+    },
+    [walletAddress, executing, addMessage],
+  );
+
+  const handleQuickAction = (prompt: string) => {
+    setInput(prompt);
+    inputRef.current?.focus();
+  };
+
+  // ─── Format message content ───────────────────────────────────────────
+
+  const formatContent = (content: string) => {
+    return content.split('\n').map((line, i) => {
+      const parts = line.split(/(\*\*[^*]+\*\*)/g).map((part, j) => {
+        if (part.startsWith('**') && part.endsWith('**')) {
+          return (
+            <strong key={j} className="text-trading-text font-semibold">
+              {part.slice(2, -2)}
+            </strong>
+          );
+        }
+        return part;
+      });
+
+      if (line.trim() === '') return <br key={i} />;
+
+      if (line.trim().startsWith('•') || line.trim().startsWith('-')) {
+        return (
+          <div key={i} className="flex gap-2 ml-2">
+            <span className="text-[#8B5CF6] flex-shrink-0">•</span>
+            <span>{parts}</span>
+          </div>
+        );
+      }
+
+      return <div key={i}>{parts}</div>;
+    });
+  };
+
+  // ─── Render ───────────────────────────────────────────────────────────
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* ─── Wallet + Hyperliquid status banner ──────────────────────── */}
+      {!walletAddress && (
+        <div className="px-3 py-2 mb-3 rounded-xl bg-yellow-500/10 border border-yellow-500/20">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-yellow-400">
+              ⚠️ Connect MetaMask to trade on Hyperliquid
+            </span>
+            <button
+              onClick={connectWallet}
+              className="px-3 py-1 text-xs font-medium bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-300 rounded-lg transition-colors"
+            >
+              Connect
+            </button>
+          </div>
+        </div>
+      )}
+      {walletAddress && hlStatus === 'checking' && (
+        <div className="px-3 py-2 mb-3 rounded-xl bg-blue-500/10 border border-blue-500/20">
+          <div className="flex items-center gap-2">
+            <div className="w-3 h-3 border-2 border-blue-400/40 border-t-blue-400 rounded-full animate-spin" />
+            <span className="text-xs text-blue-400">
+              Checking Hyperliquid account…
+            </span>
+          </div>
+        </div>
+      )}
+      {walletAddress && hlStatus === 'funded' && (
+        <div className="px-3 py-2 mb-3 rounded-xl bg-green-500/10 border border-green-500/20">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+              <span className="text-xs text-green-400">
+                Hyperliquid · {walletAddress.slice(0, 6)}…
+                {walletAddress.slice(-4)}
+              </span>
+            </div>
+            {hlBalance && (
+              <span className="text-xs text-green-400 font-medium">
+                {hlBalance}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+      {walletAddress && hlStatus === 'spot_only' && (
+        <div className="px-3 py-2.5 mb-3 rounded-xl bg-amber-500/10 border border-amber-500/20 space-y-1.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-xs">🟡</span>
+              <span className="text-xs text-amber-400 font-medium">
+                Hyperliquid account found — perps not funded
+              </span>
+            </div>
+            {hlSpotUsdc && (
+              <span className="text-xs text-amber-400 font-medium">
+                Spot: {hlSpotUsdc}
+              </span>
+            )}
+          </div>
+          <p className="text-[10px] text-amber-400/70 leading-relaxed ml-5">
+            Transfer USDC from your spot wallet to perps margin at{' '}
+            <a
+              href="https://app.hyperliquid.xyz/portfolio"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-amber-300"
+            >
+              app.hyperliquid.xyz
+            </a>{' '}
+            to enable trading.
+          </p>
+          <button
+            onClick={() => checkHLAccount(walletAddress)}
+            className="ml-5 text-[10px] text-amber-400/80 hover:text-amber-300 underline"
+          >
+            Re-check
+          </button>
+        </div>
+      )}
+      {walletAddress && hlStatus === 'unfunded' && (
+        <div className="px-3 py-2.5 mb-3 rounded-xl bg-red-500/10 border border-red-500/20 space-y-1.5">
+          <div className="flex items-center gap-2">
+            <span className="text-xs">🔴</span>
+            <span className="text-xs text-red-400 font-medium">
+              No Hyperliquid account found
+            </span>
+          </div>
+          <p className="text-[10px] text-red-400/70 leading-relaxed ml-5">
+            You need USDC deposited on Hyperliquid to trade. Use the chat to
+            swap &amp; bridge, or deposit at{' '}
+            <a
+              href="https://app.hyperliquid.xyz/portfolio"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-red-300"
+            >
+              app.hyperliquid.xyz
+            </a>
+          </p>
+          <button
+            onClick={() => checkHLAccount(walletAddress)}
+            className="ml-5 text-[10px] text-red-400/80 hover:text-red-300 underline"
+          >
+            Re-check account
+          </button>
+        </div>
+      )}
+
+      {/* ─── Messages ──────────────────────────────────────────────── */}
+      <div className="flex-1 overflow-y-auto space-y-4 px-1 pb-4">
+        {messages.length === 0 && isClient && (
+          <div className="flex flex-col items-center justify-center h-full text-center py-12">
+            <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#6D28D9] to-[#7C3AED] flex items-center justify-center mb-4 shadow-lg shadow-[#6D28D9]/20">
+              <svg
+                width="28"
+                height="28"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="white"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M2 12h4l3-9 6 18 3-9h4" />
+              </svg>
+            </div>
+            <h3 className="text-lg font-semibold text-trading-text mb-2">
+              Hyperliquid Perps
+            </h3>
+            <p className="text-sm text-trading-text-dim max-w-md mb-6">
+              {!walletAddress
+                ? 'Connect MetaMask to start trading. You can ask about markets without a wallet.'
+                : hlStatus === 'funded'
+                  ? 'Ask me about any market or tell me to trade. 150+ perps with up to 50x leverage on the fastest DEX.'
+                  : hlStatus === 'spot_only'
+                    ? 'Transfer USDC from spot to perps margin on Hyperliquid to enable trading. Ask me for help!'
+                    : hlStatus === 'unfunded'
+                      ? 'Your Hyperliquid account is not funded. Swap & bridge USDC to start trading, or ask me about markets.'
+                      : 'Checking your Hyperliquid account…'}
+            </p>
+
+            {/* Quick actions */}
+            <div className="grid grid-cols-2 gap-2 max-w-md w-full">
+              {[
+                {
+                  label: '📊 ETH Analysis',
+                  prompt:
+                    'Analyze the ETH perpetual market on Hyperliquid.',
+                },
+                {
+                  label: '📈 BTC Overview',
+                  prompt:
+                    "What's happening with BTC? Show me the market data.",
+                },
+                {
+                  label: '🔄 Swap ETH→USDC',
+                  prompt: 'Swap $50 of ETH to USDC on Base via Uniswap.',
+                },
+                {
+                  label: '🌉 Fund Hyperliquid',
+                  prompt:
+                    'I want to fund my Hyperliquid account with $100 USDC from Base. Walk me through the steps.',
+                },
+              ].map((a) => (
+                <button
+                  key={a.label}
+                  onClick={() => handleQuickAction(a.prompt)}
+                  className="text-left text-xs bg-trading-surface hover:bg-trading-surface/80 border border-trading-border hover:border-[#8B5CF6]/30 rounded-xl px-3 py-2.5 text-trading-text-secondary transition-all duration-200"
+                >
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {messages.map((message) => (
+          <div
+            key={message.id}
+            className={`flex ${
+              message.role === 'user' ? 'justify-end' : 'justify-start'
+            }`}
+          >
+            <div
+              className={`max-w-[85%] rounded-2xl px-4 py-3 ${
+                message.role === 'user'
+                  ? 'bg-gradient-to-br from-[#8B5CF6] to-[#7C3AED] text-white'
+                  : 'bg-trading-surface border border-trading-border text-trading-text-secondary'
+              }`}
+            >
+              {message.role === 'assistant' ? (
+                <div className="text-sm leading-relaxed space-y-1">
+                  {formatContent(message.content)}
+                </div>
+              ) : (
+                <p className="text-sm whitespace-pre-wrap">
+                  {message.content}
+                </p>
+              )}
+
+              {/* Open Trade button */}
+              {message.action?.type === 'open_trade' && (
+                <>
+                  <button
+                    onClick={() => {
+                      const action = message.action as TradeAction;
+                      if (action.marketData && action.sizeUsd) {
+                        setReviewModal({
+                          tradeParams: action.tradeParams,
+                          marketData: action.marketData,
+                          sizeUsd: action.sizeUsd,
+                        });
+                      } else {
+                        // Fallback to direct execution if modal data not available
+                        handleOpenTrade(action);
+                      }
+                    }}
+                    disabled={executing || hlStatus !== 'funded'}
+                    className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium text-white transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{
+                      background:
+                        executing || hlStatus !== 'funded'
+                          ? 'linear-gradient(135deg, #6B7280, #4B5563)'
+                          : (message.action as TradeAction).tradeParams
+                                .side === 'LONG'
+                            ? 'linear-gradient(135deg, #10B981, #059669)'
+                            : 'linear-gradient(135deg, #EF4444, #DC2626)',
+                    }}
+                  >
+                    {executing ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        Executing…
+                      </>
+                    ) : (
+                      <>
+                        {(message.action as TradeAction).tradeParams.side ===
+                        'LONG'
+                          ? '📈'
+                          : '📉'}{' '}
+                        {(message.action as TradeAction).tradeParams.side}{' '}
+                        {(message.action as TradeAction).tradeParams.coin} —{' '}
+                        {(message.action as TradeAction).tradeParams.size} @{' '}
+                        {
+                          (message.action as TradeAction).tradeParams.leverage
+                        }
+                        x
+                      </>
+                    )}
+                  </button>
+                  {hlStatus === 'spot_only' && (
+                    <p className="text-[10px] text-amber-400/80 mt-1 text-center">
+                      ⚠️ Transfer USDC from spot → perps margin on Hyperliquid
+                    </p>
+                  )}
+                  {hlStatus !== 'funded' && hlStatus !== 'spot_only' && (
+                    <p className="text-[10px] text-red-400/80 mt-1 text-center">
+                      ⚠️ Fund your Hyperliquid account to enable trading
+                    </p>
+                  )}
+                </>
+              )}
+
+              {/* Close Position button */}
+              {message.action?.type === 'close_trade' && (
+                <>
+                  <button
+                    onClick={() =>
+                      handleClosePosition(message.action as CloseAction)
+                    }
+                    disabled={executing || hlStatus !== 'funded'}
+                    className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium text-white transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{
+                      background:
+                        executing || hlStatus !== 'funded'
+                          ? 'linear-gradient(135deg, #6B7280, #4B5563)'
+                          : 'linear-gradient(135deg, #F59E0B, #D97706)',
+                    }}
+                  >
+                    {executing ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        Closing…
+                      </>
+                    ) : (
+                      <>
+                        🔒 Close{' '}
+                        {(message.action as CloseAction).closeParams.coin} —{' '}
+                        {(message.action as CloseAction).closeParams.size}
+                      </>
+                    )}
+                  </button>
+                  {hlStatus === 'spot_only' && (
+                    <p className="text-[10px] text-amber-400/80 mt-1 text-center">
+                      ⚠️ Transfer USDC from spot → perps margin on Hyperliquid
+                    </p>
+                  )}
+                  {hlStatus !== 'funded' && hlStatus !== 'spot_only' && (
+                    <p className="text-[10px] text-red-400/80 mt-1 text-center">
+                      ⚠️ Fund your Hyperliquid account to enable trading
+                    </p>
+                  )}
+                </>
+              )}
+
+              {/* Swap button */}
+              {message.action?.type === 'swap' && (
+                <button
+                  onClick={() => handleSwap(message.action as SwapAction)}
+                  disabled={executing}
+                  className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium text-white transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{
+                    background: executing
+                      ? 'linear-gradient(135deg, #6B7280, #4B5563)'
+                      : 'linear-gradient(135deg, #6366F1, #4F46E5)',
+                  }}
+                >
+                  {executing ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      Swapping…
+                    </>
+                  ) : (
+                    <>
+                      🔄 Swap{' '}
+                      {(message.action as SwapAction).amountInFormatted}{' '}
+                      {(message.action as SwapAction).tokenIn} →{' '}
+                      {(message.action as SwapAction).amountOutFormatted}{' '}
+                      {(message.action as SwapAction).tokenOut}
+                    </>
+                  )}
+                </button>
+              )}
+
+              {/* Bridge button */}
+              {message.action?.type === 'bridge' && (
+                <button
+                  onClick={() => handleBridge(message.action as BridgeAction)}
+                  disabled={executing}
+                  className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium text-white transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{
+                    background: executing
+                      ? 'linear-gradient(135deg, #6B7280, #4B5563)'
+                      : 'linear-gradient(135deg, #10B981, #059669)',
+                  }}
+                >
+                  {executing ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      Bridging…
+                    </>
+                  ) : (
+                    <>
+                      🌉 Bridge ${(message.action as BridgeAction).amountUsdc}{' '}
+                      USDC → Arbitrum
+                    </>
+                  )}
+                </button>
+              )}
+
+              <p
+                className={`text-[10px] mt-2 ${
+                  message.role === 'user'
+                    ? 'text-white/50'
+                    : 'text-trading-text-dim'
+                }`}
+              >
+                {new Date(message.timestamp).toLocaleTimeString()}
+              </p>
+            </div>
+          </div>
+        ))}
+
+        {/* Loading indicator */}
+        {loading && (
+          <div className="flex justify-start">
+            <div className="bg-trading-surface border border-trading-border rounded-2xl px-4 py-3">
+              <div className="flex items-center gap-2">
+                <div className="flex gap-1">
+                  <span
+                    className="w-2 h-2 bg-[#8B5CF6] rounded-full animate-bounce"
+                    style={{ animationDelay: '0ms' }}
+                  />
+                  <span
+                    className="w-2 h-2 bg-[#8B5CF6] rounded-full animate-bounce"
+                    style={{ animationDelay: '150ms' }}
+                  />
+                  <span
+                    className="w-2 h-2 bg-[#8B5CF6] rounded-full animate-bounce"
+                    style={{ animationDelay: '300ms' }}
+                  />
+                </div>
+                <span className="text-xs text-trading-text-dim">
+                  Analyzing markets...
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* ─── Input ─────────────────────────────────────────────────── */}
+      <form onSubmit={handleSubmit} className="mt-3 flex gap-2">
+        <input
+          ref={inputRef}
+          type="text"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Ask about markets or place a trade..."
+          className="flex-1 input-field text-sm"
+          disabled={loading}
+        />
+        <button
+          type="submit"
+          disabled={loading || !input.trim()}
+          className="btn-primary px-4 flex items-center gap-2 shrink-0"
+          style={{
+            background: 'linear-gradient(135deg, #8B5CF6, #7C3AED)',
+          }}
+        >
+          {loading ? (
+            <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+          ) : (
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <line x1="22" y1="2" x2="11" y2="13" />
+              <polygon points="22 2 15 22 11 13 2 9 22 2" />
+            </svg>
+          )}
+        </button>
+      </form>
+
+      {/* Review Modal */}
+      {reviewModal && walletAddress && (
+        <PerpsReviewModal
+          tradeParams={reviewModal.tradeParams}
+          marketData={reviewModal.marketData}
+          sizeUsd={reviewModal.sizeUsd}
+          walletAddress={walletAddress}
+          onConfirm={handleConfirmTrade}
+          onCancel={() => setReviewModal(null)}
+          loading={executing}
+        />
+      )}
+    </div>
+  );
+}

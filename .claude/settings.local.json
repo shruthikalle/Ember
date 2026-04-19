@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__magic__21st_magic_component_inspiration",
+      "Bash(npx tsc:*)",
+      "mcp__magic__21st_magic_component_refiner",
+      "Bash(xargs basename *)",
+      "Bash(python3 *)",
+      "Bash(node -e ' *)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "claude-flow"
+  ]
+}

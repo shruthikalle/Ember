@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme {
+  --color-trading-bg: #0a0b0f;
+  --color-trading-surface: #12141a;
+  --color-trading-border: #1e2128;
+  --color-trading-accent: #00ffa3;
+  --color-trading-accent-blue: #00a6ff;
+  --color-trading-text: #e5e7eb;
+  --color-trading-text-dim: #9ca3af;
+}
+
+@layer base {
+  body {
+    @apply bg-trading-bg text-trading-text antialiased;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-trading-surface border border-trading-border rounded-lg p-6;
+  }
+  
+  .panel-header {
+    @apply text-sm font-semibold text-trading-text uppercase tracking-wider mb-4;
+  }
+  
+  .btn-primary {
+    @apply bg-trading-accent text-black font-semibold px-6 py-3 rounded-lg hover:opacity-90 transition-all disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  
+  .input-field {
+    @apply bg-trading-bg border border-trading-border rounded-lg px-4 py-3 text-trading-text placeholder-trading-text-dim focus:outline-none focus:border-trading-accent transition-colors w-full;
+  }
+}
